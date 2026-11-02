@@ -27,7 +27,8 @@ function fixture(command) {
             assert.strictEqual(data[5], data.length - 6);
             memory[address] = data.slice(6);
             reply = sid === 0x3E ? [0x7E, 0x3D] : [0x7D];
-        } else if (sid === 0x2F) reply = [0x6F].concat(data.slice(0, 3));
+        } else if (sid === 0x10) reply = [0x50, 0x03];   // extended session (identify() asks for one first)
+        else if (sid === 0x2F) reply = [0x6F].concat(data.slice(0, 3));
         else if (sid === 0x2E) reply = [0x6E].concat(data.slice(0, 2));
         else throw new Error('Unexpected service ' + sid);
         assert(accept(reply));
@@ -43,7 +44,8 @@ function fixture(command) {
         assert.strictEqual(f.calls.length, 0);
         await p.identify();
         assert.strictEqual(p.rom, 'TEST_ROM');
-        assert.deepStrictEqual(f.calls[0].data.slice(0, 4), [2, 0xF3, 1, 0x24]);
+        assert.deepStrictEqual(f.calls[0], { target: 0x12, sid: 0x10, data: [0x03] });   // session first
+        assert.deepStrictEqual(f.calls[1].data.slice(0, 4), [2, 0xF3, 1, 0x24]);
         assert.strictEqual(await p.setMap(3), 3);
         assert.deepStrictEqual(f.memory['60000000'], [3, 1]);
         const before = f.calls.length;
@@ -79,7 +81,7 @@ function fixture(command) {
     }
     const invalid = fixture('3d');
     invalid.protocol.profiles = {};
-    await assert.rejects(() => invalid.protocol.identify(), /not uniquely matched/);
+    await assert.rejects(() => invalid.protocol.identify(), /not in the profile list/);
     assert.strictEqual(invalid.protocol.profile, null);
     assert.throws(() => addressBytes('not-an-address'), /invalid/);
     assert.throws(() => markerRom([0x62, 0xF3, 1, 0], {}), /marker absent/);

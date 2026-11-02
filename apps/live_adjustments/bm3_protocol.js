@@ -23,7 +23,13 @@ function markerRom(reply, profiles) {
     if (data.indexOf(Buffer.from('BM3_R')) < 0) throw new Error('BM3 CustomROM marker absent');
     const text = data.toString('latin1');
     const keys = Object.keys(profiles || {}).filter((key) => text.includes('#' + key));
-    if (keys.length !== 1) throw new Error('BM3 ROM key not uniquely matched in marker');
+    if (keys.length !== 1) {
+        // name what the marker actually says, so an unlisted ROM can be reported and added
+        const found = (text.match(/#[0-9A-Za-z]+/g) || []).join(' ');
+        throw new Error(keys.length
+            ? 'BM3 ROM not unique in marker (' + found + ')'
+            : 'BM3 ROM not in the profile list (' + found + ') - add it to bm3_profiles.js');
+    }
     return keys[0];
 }
 
@@ -35,6 +41,28 @@ class Bm3Protocol {
         this.rom = null;
         this.profile = null;
         this._last = Promise.resolve();
+    }
+
+    /** Marker address candidates: the location is firmware-dependent (README), so the configured
+     *  one is tried first, then the alternates. bm3MarkerAddress (single) keeps working;
+     *  bm3MarkerAddresses (list) wins when both are set. */
+    markerAddresses() {
+        const list = Array.isArray(this.config.bm3MarkerAddresses) && this.config.bm3MarkerAddresses.length
+            ? this.config.bm3MarkerAddresses.slice()
+            : [this.config.bm3MarkerAddress || '807FFE50'];
+        return list.filter((a) => /^[0-9A-Fa-f]{8}$/.test(String(a))).map(String);
+    }
+
+    _log(msg) { if (this.diag && this.diag.log && this.diag.log.info) this.diag.log.info('bm3: ' + msg); }
+
+    /** Extended diagnostic session (10 03): some firmwares only take the 2C/23 memory jobs in
+     *  it. Best effort - a refusal is logged and ignored (the reads are tried anyway). */
+    async trySession() {
+        try {
+            const r = await this.diag.physical(DME, 0x10, [0x03], 2500,
+                (u) => u[0] === 0x50 || (u[0] === 0x7F && u[1] === 0x10));
+            this._log('session 10 03: ' + (r && r[0] === 0x50 ? 'ok' : r ? 'refused NRC ' + r[2].toString(16).toUpperCase().padStart(2, '0') : 'no answer'));
+        } catch (e) { this._log('session 10 03: ' + (e && e.message || e)); }
     }
 
     /** One request at a time: a 0x63 reply carries no address, so two 0x23 reads in flight could
@@ -56,15 +84,33 @@ class Bm3Protocol {
     async identify() {
         this.profile = null;
         this.rom = null;
-        const addr = addressBytes(this.config.bm3MarkerAddress);
-        await this.request(0x2C, [0x02, 0xF3, 0x01, 0x24].concat(addr, [0, MARKER_SIZE]), [0x02, 0xF3, 0x01]);
-        const marker = await this.request(0x22, [0xF3, 0x01], [0xF3, 0x01]);
+        await this.trySession();
+        const tried = [];
+        let marker = null, markerAddr = null;
+        for (const cand of this.markerAddresses()) {
+            const outcome = { address: cand };
+            try {
+                await this.request(0x2C, [0x02, 0xF3, 0x01, 0x24].concat(addressBytes(cand), [0, MARKER_SIZE]), [0x02, 0xF3, 0x01]);
+                const reply = await this.request(0x22, [0xF3, 0x01], [0xF3, 0x01]);
+                const text = Buffer.from(reply.slice(3)).toString('latin1');
+                outcome.text = text.replace(/[^\x20-\x7e]/g, '.').slice(0, 96);
+                if (text.indexOf('BM3_R') >= 0) { marker = reply; markerAddr = cand; }
+            } catch (e) {
+                outcome.error = String(e && e.message || e);
+            }
+            tried.push(outcome);
+            this._log('marker @ ' + cand + ': ' + (outcome.error || ('"' + outcome.text + '"')));
+            if (marker) break;
+        }
+        if (!marker) {
+            throw new Error('BM3 CustomROM marker not found - ' + tried.map((o) => o.address + ' ' + (o.error || 'no BM3_R')).join(' | '));
+        }
         const rom = markerRom(marker, this.profiles);
         const profile = this.profiles[rom];
         if (!profile || !profile.mapSwActAddr || profile.rom !== rom) throw new Error('BM3 profile unavailable');
         this.rom = rom;
         this.profile = profile;
-        return { rom };
+        return { rom, markerAddress: markerAddr };
     }
 
     ready() {

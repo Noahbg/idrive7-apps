@@ -19,6 +19,19 @@ function dme(kind) {
         await new Promise(setImmediate);                                // the DME answers later
         inflight--;
         const addr = () => Buffer.from(data.slice(1, 5)).toString('hex').toUpperCase();
+        if (kind === 'bm3-alt') {                                   // marker only at the alternate address
+            if (sid === 0x2C) {
+                const at = Buffer.from(data.slice(4, 8)).toString('hex').toUpperCase();
+                return at === '807FF750' ? [0x6C, 0x02, 0xF3, 0x01] : [0x7F, 0x2C, 0x31];
+            }
+            if (sid === 0x22) return [0x62, 0xF3, 0x01].concat(Array.from(Buffer.from('BM3_R#011000#')));
+            if (sid === 0x23) return [0x63].concat(memory[addr()].slice(0, data[5]));
+            if (sid === 0x3D) { memory[addr()] = data.slice(6); return [0x7D]; }
+        }
+        if (kind === 'bm3-unknown') {                               // a flashed ROM that is not in the profile list
+            if (sid === 0x2C) return [0x6C, 0x02, 0xF3, 0x01];
+            if (sid === 0x22) return [0x62, 0xF3, 0x01].concat(Array.from(Buffer.from('BM3_R#030001#')));
+        }
         if (kind === 'bm3') {
             if (sid === 0x2C) return [0x6C, 0x02, 0xF3, 0x01];
             if (sid === 0x22) return [0x62, 0xF3, 0x01].concat(Array.from(Buffer.from('BM3_R#011000#')));
@@ -50,7 +63,7 @@ async function setup(kind, tuner, available, rpm) {
     const d = dme(kind);
     if (available === false) d.link.available = false;
     const ctx = { settings: { get: (k) => (k === 'tuner' ? tuner : undefined) },
-        log: { info() {}, warn() {}, error() {} }, spec: { config: { bm3MarkerAddress: '807FFE50' } } };
+        log: { info() {}, warn() {}, error() {} }, spec: { config: Object.assign({ bm3MarkerAddress: '807FFE50' }, arguments[4]) } };
     const engine = { value: rpm === undefined ? 800 : rpm, rpm() { return this.value; } };   // engine running by default
     const tune = new TuneControl(ctx, engine);
     await tune.start(d.link);
@@ -352,6 +365,19 @@ async function xdriveChecks() {
     assert.deepStrictEqual(s.d.calls, []);
     await s.tune.setMap(3);                                         // the map is not rpm-gated
     assert.strictEqual(s.d.calls.at(-1), '2f 01 02');
+
+    // BM3 detection diagnostics: the marker sits at the alternate address -> the address list finds it.
+    s = await setup('bm3-alt', 'bm3', true, undefined, { bm3MarkerAddresses: ['807FFE50', '807FF750'] });
+    assert.strictEqual(s.tune.map, 2, 'marker found via the alternate address');
+    assert(/ROM 011000/.test(s.tune.note), s.tune.note);
+    await s.tune.setMap(3);
+    assert.deepStrictEqual(s.d.memory.D001D006, [2, 1]);
+
+    // BM3 detection diagnostics: a ROM key that is not in bm3_profiles.js is named, not just 'not matched'.
+    s = await setup('bm3-unknown', 'bm3');
+    assert.strictEqual(s.tune.map, null);
+    assert(/not in the profile list/.test(s.tune.note) && /#030001/.test(s.tune.note), s.tune.note);
+    assert(!s.d.calls.some((c) => /^(3d|3e)/.test(c)), 'no memory write without a matched profile');
 
     // BM3: map and burbles written to memory and confirmed by read-back; ASD; no cooling.
     s = await setup('bm3', 'bm3');
